@@ -23,6 +23,7 @@ import org.slf4j.LoggerFactory;
 import java.io.*;
 import java.net.URISyntaxException;
 import java.net.URL;
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.LinkedList;
 import java.util.List;
@@ -115,6 +116,16 @@ public class InterpreterOutput extends OutputStream {
     };
   }
 
+  public List<InterpreterResultMessage> getInterpreterResultMessages() throws IOException {
+    synchronized (resultMessageOutputs) {
+      List<InterpreterResultMessage> resultMessages = new ArrayList<>();
+      for (InterpreterResultMessageOutput output : this.resultMessageOutputs) {
+        resultMessages.add(output.toInterpreterResultMessage());
+      }
+      return resultMessages;
+    }
+  }
+
   public InterpreterResultMessageOutput getCurrentOutput() {
     synchronized (resultMessageOutputs) {
       return currentOut;
@@ -184,9 +195,9 @@ public class InterpreterOutput extends OutputStream {
         if (b == NEW_LINE_CHAR && currentOut != null) {
           InterpreterResult.Type type = currentOut.getType();
           if (type == InterpreterResult.Type.TEXT || type == InterpreterResult.Type.TABLE) {
-
-            setType(InterpreterResult.Type.TEXT);
-            getCurrentOutput().write("Output exceeds " + limit + ". Truncated.\n");
+            setType(InterpreterResult.Type.HTML);
+            getCurrentOutput().write(ResultMessages.getExceedsLimitSizeMessage(limit,
+                "ZEPPELIN_INTERPRETER_OUTPUT_LIMIT").getData().getBytes());
             truncated = true;
             return;
           }

@@ -21,8 +21,8 @@ import static org.junit.Assert.assertTrue;
 import java.io.File;
 import java.io.IOException;
 import java.net.URI;
+import java.net.URISyntaxException;
 import java.util.List;
-
 import org.apache.commons.io.FileUtils;
 import org.apache.commons.lang3.StringUtils;
 import org.apache.zeppelin.AbstractZeppelinIT;
@@ -37,6 +37,7 @@ import org.junit.Test;
 import org.junit.rules.ErrorCollector;
 import org.openqa.selenium.By;
 import org.openqa.selenium.Keys;
+import org.openqa.selenium.TimeoutException;
 import org.openqa.selenium.WebElement;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -62,12 +63,14 @@ public class AuthenticationIT extends AbstractZeppelinIT {
       "securityManager.sessionManager = $sessionManager\n" +
       "securityManager.sessionManager.globalSessionTimeout = 86400000\n" +
       "shiro.loginUrl = /api/login\n" +
+      "anyofroles = org.apache.zeppelin.utils.AnyOfRolesAuthorizationFilter\n" +
       "[roles]\n" +
       "admin = *\n" +
       "hr = *\n" +
       "finance = *\n" +
       "[urls]\n" +
       "/api/version = anon\n" +
+      "/api/interpreter/** = authc, anyofroles[admin, finance]\n" +
       "/** = authc";
 
   static String originalShiro = "";
@@ -80,7 +83,7 @@ public class AuthenticationIT extends AbstractZeppelinIT {
     }
 
     try {
-      System.setProperty(ZeppelinConfiguration.ConfVars.ZEPPELIN_HOME.getVarName(), "../");
+      System.setProperty(ZeppelinConfiguration.ConfVars.ZEPPELIN_HOME.getVarName(), new File("../").getAbsolutePath());
       ZeppelinConfiguration conf = ZeppelinConfiguration.create();
       shiroPath = conf.getRelativeDir(String.format("%s/shiro.ini", conf.getConfDir()));
       File file = new File(shiroPath);
@@ -117,14 +120,14 @@ public class AuthenticationIT extends AbstractZeppelinIT {
     driver.quit();
   }
 
-  private void authenticationUser(String userName, String password) {
+  public void authenticationUser(String userName, String password) {
     pollingWait(By.xpath(
         "//div[contains(@class, 'navbar-collapse')]//li//button[contains(.,'Login')]"),
         MAX_BROWSER_TIMEOUT_SEC).click();
     ZeppelinITUtils.sleep(1000, false);
     pollingWait(By.xpath("//*[@id='userName']"), MAX_BROWSER_TIMEOUT_SEC).sendKeys(userName);
     pollingWait(By.xpath("//*[@id='password']"), MAX_BROWSER_TIMEOUT_SEC).sendKeys(password);
-    pollingWait(By.xpath("//*[@id='NoteImportCtrl']//button[contains(.,'Login')]"),
+    pollingWait(By.xpath("//*[@id='loginModalContent']//button[contains(.,'Login')]"),
         MAX_BROWSER_TIMEOUT_SEC).click();
     ZeppelinITUtils.sleep(1000, false);
   }
@@ -146,14 +149,20 @@ public class AuthenticationIT extends AbstractZeppelinIT {
     }
   }
 
-  private void logoutUser(String userName) {
+  public void logoutUser(String userName) throws URISyntaxException {
     ZeppelinITUtils.sleep(500, false);
     driver.findElement(By.xpath("//div[contains(@class, 'navbar-collapse')]//li[contains(.,'" +
         userName + "')]")).click();
     ZeppelinITUtils.sleep(500, false);
     driver.findElement(By.xpath("//div[contains(@class, 'navbar-collapse')]//li[contains(.,'" +
         userName + "')]//a[@ng-click='navbar.logout()']")).click();
-    ZeppelinITUtils.sleep(5000, false);
+    ZeppelinITUtils.sleep(2000, false);
+    if (driver.findElement(By.xpath("//*[@id='loginModal']//div[contains(@class, 'modal-header')]/button"))
+        .isDisplayed()) {
+      driver.findElement(By.xpath("//*[@id='loginModal']//div[contains(@class, 'modal-header')]/button")).click();
+    }
+    driver.get(new URI(driver.getCurrentUrl()).resolve("/#/").toString());
+    ZeppelinITUtils.sleep(500, false);
   }
 
   //  @Test
@@ -176,6 +185,62 @@ public class AuthenticationIT extends AbstractZeppelinIT {
   }
 
   @Test
+  public void testAnyOfRoles() throws Exception {
+    if (!endToEndTestEnabled()) {
+      return;
+    }
+    try {
+      AuthenticationIT authenticationIT = new AuthenticationIT();
+      authenticationIT.authenticationUser("admin", "password1");
+
+      pollingWait(By.xpath("//div/button[contains(@class, 'nav-btn dropdown-toggle ng-scope')]"),
+          MAX_BROWSER_TIMEOUT_SEC).click();
+      clickAndWait(By.xpath("//li/a[contains(@href, '#/interpreter')]"));
+
+      collector.checkThat("Check is user has permission to view this page", true,
+          CoreMatchers.equalTo(pollingWait(By.xpath(
+              "//div[@id='main']/div/div[2]"),
+              MIN_IMPLICIT_WAIT).isDisplayed())
+      );
+
+      authenticationIT.logoutUser("admin");
+
+      authenticationIT.authenticationUser("finance1", "finance1");
+
+      pollingWait(By.xpath("//div/button[contains(@class, 'nav-btn dropdown-toggle ng-scope')]"),
+          MAX_BROWSER_TIMEOUT_SEC).click();
+      clickAndWait(By.xpath("//li/a[contains(@href, '#/interpreter')]"));
+
+      collector.checkThat("Check is user has permission to view this page", true,
+          CoreMatchers.equalTo(pollingWait(By.xpath(
+              "//div[@id='main']/div/div[2]"),
+              MIN_IMPLICIT_WAIT).isDisplayed())
+      );
+      
+      authenticationIT.logoutUser("finance1");
+
+      authenticationIT.authenticationUser("hr1", "hr1");
+
+      pollingWait(By.xpath("//div/button[contains(@class, 'nav-btn dropdown-toggle ng-scope')]"),
+          MAX_BROWSER_TIMEOUT_SEC).click();
+      clickAndWait(By.xpath("//li/a[contains(@href, '#/interpreter')]"));
+
+      try {
+        collector.checkThat("Check is user has permission to view this page",
+            true, CoreMatchers.equalTo(
+                pollingWait(By.xpath("//li[contains(@class, 'ng-toast__message')]//span/span"),
+                    MIN_IMPLICIT_WAIT).isDisplayed()));
+      } catch (TimeoutException e) {
+        throw new Exception("Expected ngToast not found", e);
+      }
+      authenticationIT.logoutUser("hr1");
+
+    } catch (Exception e) {
+      handleException("Exception in AuthenticationIT while testAnyOfRoles ", e);
+    }
+  }
+
+  @Test
   public void testGroupPermission() throws Exception {
     if (!endToEndTestEnabled()) {
       return;
@@ -187,12 +252,14 @@ public class AuthenticationIT extends AbstractZeppelinIT {
 
       String noteId = driver.getCurrentUrl().substring(driver.getCurrentUrl().lastIndexOf("/") + 1);
 
-      pollingWait(By.xpath("//span[@tooltip='Note permissions']"),
+      pollingWait(By.xpath("//span[@uib-tooltip='Note permissions']"),
           MAX_BROWSER_TIMEOUT_SEC).click();
       pollingWait(By.xpath(".//*[@id='selectOwners']/following::span//input"),
           MAX_BROWSER_TIMEOUT_SEC).sendKeys("finance ");
       pollingWait(By.xpath(".//*[@id='selectReaders']/following::span//input"),
           MAX_BROWSER_TIMEOUT_SEC).sendKeys("finance ");
+      pollingWait(By.xpath(".//*[@id='selectRunners']/following::span//input"),
+              MAX_BROWSER_TIMEOUT_SEC).sendKeys("finance ");
       pollingWait(By.xpath(".//*[@id='selectWriters']/following::span//input"),
           MAX_BROWSER_TIMEOUT_SEC).sendKeys("finance ");
       pollingWait(By.xpath("//button[@ng-click='savePermissions()']"), MAX_BROWSER_TIMEOUT_SEC)
@@ -247,7 +314,7 @@ public class AuthenticationIT extends AbstractZeppelinIT {
 
 
     } catch (Exception e) {
-      handleException("Exception in ParagraphActionsIT while testGroupPermission ", e);
+      handleException("Exception in AuthenticationIT while testGroupPermission ", e);
     }
   }
 

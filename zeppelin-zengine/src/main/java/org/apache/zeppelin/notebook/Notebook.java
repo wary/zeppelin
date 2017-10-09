@@ -18,7 +18,6 @@
 package org.apache.zeppelin.notebook;
 
 import java.io.IOException;
-import java.io.StringReader;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
@@ -35,10 +34,8 @@ import com.google.common.base.Preconditions;
 import com.google.common.base.Predicate;
 import com.google.common.collect.FluentIterable;
 import com.google.common.collect.Sets;
-import com.google.gson.Gson;
-import com.google.gson.GsonBuilder;
-import com.google.gson.stream.JsonReader;
 import org.apache.zeppelin.interpreter.*;
+import org.apache.zeppelin.interpreter.remote.RemoteAngularObjectRegistry;
 import org.quartz.CronScheduleBuilder;
 import org.quartz.CronTrigger;
 import org.quartz.JobBuilder;
@@ -56,11 +53,9 @@ import org.apache.zeppelin.conf.ZeppelinConfiguration;
 import org.apache.zeppelin.conf.ZeppelinConfiguration.ConfVars;
 import org.apache.zeppelin.display.AngularObject;
 import org.apache.zeppelin.display.AngularObjectRegistry;
-import org.apache.zeppelin.interpreter.remote.RemoteAngularObjectRegistry;
 import org.apache.zeppelin.notebook.repo.NotebookRepo;
 import org.apache.zeppelin.notebook.repo.NotebookRepo.Revision;
 import org.apache.zeppelin.notebook.repo.NotebookRepoSync;
-import org.apache.zeppelin.resource.ResourcePoolUtils;
 import org.apache.zeppelin.scheduler.Job;
 import org.apache.zeppelin.scheduler.SchedulerFactory;
 import org.apache.zeppelin.search.SearchService;
@@ -140,7 +135,7 @@ public class Notebook implements NoteEventListener {
     Preconditions.checkNotNull(subject, "AuthenticationInfo should not be null");
     Note note;
     if (conf.getBoolean(ConfVars.ZEPPELIN_NOTEBOOK_AUTO_INTERPRETER_BINDING)) {
-      note = createNote(interpreterSettingManager.getDefaultInterpreterSettingList(), subject);
+      note = createNote(interpreterSettingManager.getInterpreterSettingIds(), subject);
     } else {
       note = createNote(null, subject);
     }
@@ -182,14 +177,11 @@ public class Notebook implements NoteEventListener {
    * @throws IOException, IllegalArgumentException
    */
   public String exportNote(String noteId) throws IOException, IllegalArgumentException {
-    GsonBuilder gsonBuilder = new GsonBuilder();
-    gsonBuilder.setPrettyPrinting();
-    Gson gson = gsonBuilder.create();
     Note note = getNote(noteId);
     if (note == null) {
       throw new IllegalArgumentException(noteId + " not found");
     }
-    return gson.toJson(note);
+    return note.toJson();
   }
 
   /**
@@ -202,16 +194,9 @@ public class Notebook implements NoteEventListener {
    */
   public Note importNote(String sourceJson, String noteName, AuthenticationInfo subject)
       throws IOException {
-    GsonBuilder gsonBuilder = new GsonBuilder();
-    gsonBuilder.setPrettyPrinting();
-
-    Gson gson =
-        gsonBuilder.registerTypeAdapter(Date.class, new NotebookImportDeserializer()).create();
-    JsonReader reader = new JsonReader(new StringReader(sourceJson));
-    reader.setLenient(true);
     Note newNote;
     try {
-      Note oldNote = gson.fromJson(reader, Note.class);
+      Note oldNote = Note.fromJson(sourceJson);
       convertFromSingleResultToMultipleResultsFormat(oldNote);
       newNote = createNote(subject);
       if (noteName != null)
@@ -280,8 +265,8 @@ public class Notebook implements NoteEventListener {
         }
       }
 
-      interpreterSettingManager.setInterpreters(user, note.getId(), interpreterSettingIds);
-      // comment out while note.getNoteReplLoader().setInterpreters(...) do the same
+      interpreterSettingManager.setInterpreterBinding(user, note.getId(), interpreterSettingIds);
+      // comment out while note.getNoteReplLoader().setInterpreterBinding(...) do the same
       // replFactory.putNoteInterpreterSettingBinding(id, interpreterSettingIds);
     }
   }
@@ -289,7 +274,7 @@ public class Notebook implements NoteEventListener {
   List<String> getBindedInterpreterSettingsIds(String id) {
     Note note = getNote(id);
     if (note != null) {
-      return interpreterSettingManager.getInterpreters(note.getId());
+      return interpreterSettingManager.getInterpreterBinding(note.getId());
     } else {
       return new LinkedList<>();
     }
@@ -323,9 +308,10 @@ public class Notebook implements NoteEventListener {
   }
 
   public void moveNoteToTrash(String noteId) {
-    for (InterpreterSetting interpreterSetting : interpreterSettingManager
-        .getInterpreterSettings(noteId)) {
-      interpreterSettingManager.removeInterpretersForNote(interpreterSetting, "", noteId);
+    try {
+      interpreterSettingManager.setInterpreterBinding("", noteId, new ArrayList<String>());
+    } catch (IOException e) {
+      e.printStackTrace();
     }
   }
 
@@ -338,14 +324,18 @@ public class Notebook implements NoteEventListener {
       note = notes.remove(id);
       folders.removeNote(note);
     }
-    interpreterSettingManager.removeNoteInterpreterSettingBinding(subject.getUser(), id);
+    try {
+      interpreterSettingManager.removeNoteInterpreterSettingBinding(subject.getUser(), id);
+    } catch (IOException e) {
+      logger.error(e.toString(), e);
+    }
     noteSearchService.deleteIndexDocs(note);
     notebookAuthorization.removeNote(id);
 
     // remove from all interpreter instance's angular object registry
     for (InterpreterSetting settings : interpreterSettingManager.get()) {
       AngularObjectRegistry registry =
-          settings.getInterpreterGroup(subject.getUser(), id).getAngularObjectRegistry();
+          settings.getOrCreateInterpreterGroup(subject.getUser(), id).getAngularObjectRegistry();
       if (registry instanceof RemoteAngularObjectRegistry) {
         // remove paragraph scope object
         for (Paragraph p : note.getParagraphs()) {
@@ -380,7 +370,7 @@ public class Notebook implements NoteEventListener {
       }
     }
 
-    ResourcePoolUtils.removeResourcesBelongsToNote(id);
+    interpreterSettingManager.removeResourcesBelongsToNote(id);
 
     fireNoteRemoveEvent(note);
 
@@ -414,6 +404,10 @@ public class Notebook implements NoteEventListener {
   public void convertFromSingleResultToMultipleResultsFormat(Note note) {
     for (Paragraph p : note.paragraphs) {
       Object ret = p.getPreviousResultFormat();
+      if (ret != null && p.results != null) {
+        continue; // already converted
+      }
+
       try {
         if (ret != null && ret instanceof Map) {
           Map r = ((Map) ret);
@@ -523,7 +517,8 @@ public class Notebook implements NoteEventListener {
       SnapshotAngularObject snapshot = angularObjectSnapshot.get(name);
       List<InterpreterSetting> settings = interpreterSettingManager.get();
       for (InterpreterSetting setting : settings) {
-        InterpreterGroup intpGroup = setting.getInterpreterGroup(subject.getUser(), note.getId());
+        InterpreterGroup intpGroup = setting.getOrCreateInterpreterGroup(subject.getUser(),
+            note.getId());
         if (intpGroup.getId().equals(snapshot.getIntpGroupId())) {
           AngularObjectRegistry registry = intpGroup.getAngularObjectRegistry();
           String noteId = snapshot.getAngularObject().getNoteId();
@@ -831,7 +826,7 @@ public class Notebook implements NoteEventListener {
 
         // get data for the job manager.
         Map<String, Object> paragraphItem = getParagraphForJobManagerItem(paragraph);
-        lastRunningUnixTime = getUnixTimeLastRunParagraph(paragraph);
+        lastRunningUnixTime = Math.max(getUnixTimeLastRunParagraph(paragraph), lastRunningUnixTime);
 
         // is update note for last server update time.
         if (lastRunningUnixTime > lastUpdateServerUnixTime) {

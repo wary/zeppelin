@@ -48,8 +48,6 @@ import org.eclipse.jetty.websocket.client.WebSocketClient;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import com.google.gson.Gson;
-import com.google.gson.JsonSyntaxException;
 
 /**
  * Zeppelin websocket client.
@@ -59,7 +57,6 @@ public class ZeppelinClient {
   private static final Logger LOG = LoggerFactory.getLogger(ZeppelinClient.class);
   private final URI zeppelinWebsocketUrl;
   private final WebSocketClient wsClient;
-  private static Gson gson;
   // Keep track of current open connection per notebook.
   private ConcurrentHashMap<String, Session> notesConnection;
   // Listen to every note actions.
@@ -99,7 +96,6 @@ public class ZeppelinClient {
   private ZeppelinClient(String zeppelinUrl, String token, ZeppelinConfiguration conf) {
     zeppelinWebsocketUrl = URI.create(zeppelinUrl);
     wsClient = createNewWebsocketClient();
-    gson = new Gson();
     notesConnection = new ConcurrentHashMap<>();
     schedulerService = SchedulerService.getInstance();
     authModule = Authentication.initialize(token, conf);
@@ -137,9 +133,22 @@ public class ZeppelinClient {
     new Timer().schedule(new java.util.TimerTask() {
       @Override
       public void run() {
-        watcherSession = openWatcherSession();
+        int time = 0;
+        while (time < 5 * MIN) {
+          watcherSession = openWatcherSession();
+          if (watcherSession == null) {
+            try {
+              Thread.sleep(5000);
+              time += 5;
+            } catch (InterruptedException e) {
+              //continue
+            }
+          } else {
+            break;
+          }
+        }
       }
-    }, 10000);
+    }, 5000);
   }
 
   public void stop() {
@@ -164,7 +173,7 @@ public class ZeppelinClient {
       zeppelinMsg.ticket = authModule.getTicket();
       zeppelinMsg.roles = authModule.getRoles();
     }
-    String msg = gson.toJson(zeppelinMsg);
+    String msg = zeppelinMsg.toJson();
     return msg;
   }
 
@@ -176,14 +185,12 @@ public class ZeppelinClient {
     if (StringUtils.isBlank(zeppelinMessage)) {
       return null;
     }
-    Message msg;
     try {
-      msg = gson.fromJson(zeppelinMessage, Message.class);
-    } catch (JsonSyntaxException ex) {
-      LOG.error("Cannot deserialize zeppelin message", ex);
-      msg = null;
+      return Message.fromJson(zeppelinMessage);
+    } catch (Exception e) {
+      LOG.error("Fail to parse zeppelinMessage", e);
+      return null;
     }
-    return msg;
   }
   
   private Session openWatcherSession() {
@@ -303,7 +310,7 @@ public class ZeppelinClient {
     if (StringUtils.isEmpty(token)) {
       relayToAllZeppelinHub(hubMsg, noteId);
     } else {
-      client.relayToZeppelinHub(hubMsg.serialize(), token);
+      client.relayToZeppelinHub(hubMsg.toJson(), token);
     }
 
   }
@@ -323,7 +330,7 @@ public class ZeppelinClient {
       if (noteAuth.isReader(noteId, userAndRoles)) {
         token = userTokens.get(user);
         hubMsg.meta.put("token", token);
-        client.relayToZeppelinHub(hubMsg.serialize(), token);
+        client.relayToZeppelinHub(hubMsg.toJson(), token);
       }
     }
   }

@@ -20,8 +20,8 @@
 set -ev
 touch ~/.environ
 
-# Install R dependencies if R profiles are used
-if [[ ${PROFILE/"-Pr "} != $PROFILE ]] || [[ ${PROFILE/"-Psparkr "} != $PROFILE ]] ; then
+# Install R dependencies if SPARKR is true
+if [[ "${SPARKR}" = "true" ]] ; then
   echo "R_LIBS=~/R" > ~/.Renviron
   echo "export R_LIBS=~/R" >> ~/.environ
   source ~/.environ
@@ -44,5 +44,6 @@ if [[ -n "$PYTHON" ]] ; then
   conda update -q conda
   conda info -a
   conda config --add channels conda-forge
-  conda install -q matplotlib pandasql
+  conda install -q matplotlib pandasql ipython jupyter_client ipykernel matplotlib bokeh
+  pip install -q grpcio ggplot
 fi

@@ -81,8 +81,9 @@ public class WebDriverManager {
         profile.setPreference("browser.helperApps.neverAsk.saveToDisk", "application/x-ustar,application/octet-stream,application/zip,text/csv,text/plain");
         profile.setPreference("network.proxy.type", 0);
 
-        profile.addExtension(new File(firebugPath));
-        profile.addExtension(new File(firepathPath));
+        // Commenting out installing extensions. See ZEPPELIN-2962.
+        // profile.addExtension(new File(firebugPath));
+        // profile.addExtension(new File(firepathPath));
 
         driver = new FirefoxDriver(ffox, profile);
       } catch (Exception e) {
@@ -125,7 +126,7 @@ public class WebDriverManager {
         (new WebDriverWait(driver, 30)).until(new ExpectedCondition<Boolean>() {
           @Override
           public Boolean apply(WebDriver d) {
-            return d.findElement(By.xpath("//i[@tooltip='WebSocket Connected']"))
+            return d.findElement(By.xpath("//i[@uib-tooltip='WebSocket Connected']"))
                 .isDisplayed();
           }
         });
@@ -141,6 +142,7 @@ public class WebDriverManager {
       fail();
     }
 
+    driver.manage().window().maximize();
     return driver;
   }
 

@@ -41,6 +41,7 @@ public abstract class Job {
   /**
    * Job status.
    *
+   * UNKNOWN - Job is not found in remote
    * READY - Job is not running, ready to run.
    * PENDING - Job is submitted to scheduler. but not running yet
    * RUNNING - Job is running.
@@ -48,8 +49,8 @@ public abstract class Job {
    * ERROR - Job finished run. with error
    * ABORT - Job finished by abort
    */
-  public static enum Status {
-    READY, PENDING, RUNNING, FINISHED, ERROR, ABORT;
+  public enum Status {
+    UNKNOWN, READY, PENDING, RUNNING, FINISHED, ERROR, ABORT;
 
     public boolean isReady() {
       return this == READY;
@@ -70,14 +71,14 @@ public abstract class Job {
   Date dateCreated;
   Date dateStarted;
   Date dateFinished;
-  Status status;
+  volatile Status status;
 
   static Logger LOGGER = LoggerFactory.getLogger(Job.class);
 
   transient boolean aborted = false;
 
-  String errorMessage;
-  private transient Throwable exception;
+  private volatile String errorMessage;
+  private transient volatile Throwable exception;
   private transient JobListener listener;
   private long progressUpdateIntervalMs;
 
@@ -174,26 +175,33 @@ public abstract class Job {
 
   public void run() {
     JobProgressPoller progressUpdator = null;
+    dateStarted = new Date();
     try {
       progressUpdator = new JobProgressPoller(this, progressUpdateIntervalMs);
       progressUpdator.start();
-      dateStarted = new Date();
-      setResult(jobRun());
-      this.exception = null;
-      errorMessage = null;
-      dateFinished = new Date();
+      completeWithSuccess(jobRun());
     } catch (Throwable e) {
       LOGGER.error("Job failed", e);
-      this.exception = e;
-      setResult(e.getMessage());
-      errorMessage = getStack(e);
-      dateFinished = new Date();
+      completeWithError(e);
     } finally {
       if (progressUpdator != null) {
         progressUpdator.interrupt();
       }
       //aborted = false;
     }
+  }
+
+  private synchronized void completeWithSuccess(Object result) {
+    setResult(result);
+    exception = null;
+    errorMessage = null;
+    dateFinished = new Date();
+  }
+
+  private synchronized void completeWithError(Throwable error) {
+    setResult(error.getMessage());
+    setException(error);
+    dateFinished = new Date();
   }
 
   public static String getStack(Throwable e) {
@@ -209,11 +217,11 @@ public abstract class Job {
     }
   }
 
-  public Throwable getException() {
+  public synchronized Throwable getException() {
     return exception;
   }
 
-  protected void setException(Throwable t) {
+  protected synchronized void setException(Throwable t) {
     exception = t;
     errorMessage = getStack(t);
   }
@@ -252,13 +260,25 @@ public abstract class Job {
     return dateStarted;
   }
 
-  public Date getDateFinished() {
+  public synchronized void setDateStarted(Date startedAt) {
+    dateStarted = startedAt;
+  }
+
+  public synchronized Date getDateFinished() {
     return dateFinished;
+  }
+
+  public synchronized void setDateFinished(Date finishedAt) {
+    dateFinished = finishedAt;
   }
 
   public abstract void setResult(Object results);
 
-  public void setErrorMessage(String errorMessage) {
+  public synchronized String getErrorMessage() {
+    return errorMessage;
+  }
+
+  public synchronized void setErrorMessage(String errorMessage) {
     this.errorMessage = errorMessage;
   }
 }

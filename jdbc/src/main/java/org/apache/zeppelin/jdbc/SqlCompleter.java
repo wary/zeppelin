@@ -4,15 +4,6 @@ package org.apache.zeppelin.jdbc;
  * This source file is based on code taken from SQLLine 1.0.2 See SQLLine notice in LICENSE
  */
 
-import com.google.common.base.Joiner;
-import com.google.common.collect.Sets;
-import com.google.common.collect.Sets.SetView;
-import jline.console.completer.ArgumentCompleter.ArgumentList;
-import jline.console.completer.ArgumentCompleter.WhitespaceArgumentDelimiter;
-import jline.console.completer.StringsCompleter;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-
 import java.io.BufferedReader;
 import java.io.IOException;
 import java.io.InputStreamReader;
@@ -20,17 +11,36 @@ import java.sql.Connection;
 import java.sql.DatabaseMetaData;
 import java.sql.ResultSet;
 import java.sql.SQLException;
-import java.util.*;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.StringTokenizer;
+import java.util.TreeSet;
 import java.util.regex.Pattern;
 
-import static org.apache.commons.lang.StringUtils.isBlank;
+import org.apache.commons.lang.StringUtils;
+import org.apache.commons.lang.math.NumberUtils;
+import org.apache.zeppelin.completer.CachedCompleter;
+import org.apache.zeppelin.completer.CompletionType;
+import org.apache.zeppelin.completer.StringsCompleter;
+import org.apache.zeppelin.interpreter.thrift.InterpreterCompletion;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import jline.console.completer.ArgumentCompleter.ArgumentList;
+import jline.console.completer.ArgumentCompleter.WhitespaceArgumentDelimiter;
 
 /**
  * SQL auto complete functionality for the JdbcInterpreter.
  */
-public class SqlCompleter extends StringsCompleter {
+public class SqlCompleter {
 
   private static Logger logger = LoggerFactory.getLogger(SqlCompleter.class);
+
 
   /**
    * Delimiter that can split SQL statement in keyword list
@@ -49,26 +59,32 @@ public class SqlCompleter extends StringsCompleter {
   /**
    * Schema completer
    */
-  private StringsCompleter schemasCompleter = new StringsCompleter();
+  private CachedCompleter schemasCompleter;
 
   /**
    * Contain different completer with table list for every schema name
    */
-  private Map<String, StringsCompleter> tablesCompleters = new HashMap<>();
+  private Map<String, CachedCompleter> tablesCompleters = new HashMap<>();
 
   /**
    * Contains different completer with column list for every table name
    * Table names store as schema_name.table_name
    */
-  private Map<String, StringsCompleter> columnsCompleters = new HashMap<>();
+  private Map<String, CachedCompleter> columnsCompleters = new HashMap<>();
 
   /**
    * Completer for sql keywords
    */
-  private StringsCompleter keywordCompleter = new StringsCompleter();
+  private CachedCompleter keywordCompleter;
 
-  @Override
-  public int complete(String buffer, int cursor, List<CharSequence> candidates) {
+  private int ttlInSeconds;
+
+
+  public SqlCompleter(int ttlInSeconds) {
+    this.ttlInSeconds = ttlInSeconds;
+  }
+
+  public int complete(String buffer, int cursor, List<InterpreterCompletion> candidates) {
 
     logger.debug("Complete with buffer = " + buffer + ", cursor = " + cursor);
 
@@ -76,21 +92,20 @@ public class SqlCompleter extends StringsCompleter {
     // white spaces.
     ArgumentList argumentList = sqlDelimiter.delimit(buffer, cursor);
 
-    String beforeCursorBuffer = buffer.substring(0,
-            Math.min(cursor, buffer.length())).toUpperCase();
+    Pattern whitespaceEndPatter = Pattern.compile("\\s$");
+    String cursorArgument = null;
+    int argumentPosition;
+    if (buffer.length() == 0 || whitespaceEndPatter.matcher(buffer).find()) {
+      argumentPosition = buffer.length() - 1;
+    } else {
+      cursorArgument = argumentList.getCursorArgument();
+      argumentPosition = argumentList.getArgumentPosition();
+    }
 
-    // check what sql is and where cursor is to allow column completion or not
-    boolean isColumnAllowed = true;
-    if (beforeCursorBuffer.contains("SELECT ") && beforeCursorBuffer.contains(" FROM ")
-            && !beforeCursorBuffer.contains(" WHERE "))
-      isColumnAllowed = false;
-
-    int complete = completeName(argumentList.getCursorArgument(),
-            argumentList.getArgumentPosition(), candidates,
-            findAliasesInSQL(argumentList.getArguments()), isColumnAllowed);
+    int complete = completeName(cursorArgument, argumentPosition, candidates,
+            findAliasesInSQL(argumentList.getArguments()));
 
     logger.debug("complete:" + complete + ", size:" + candidates.size());
-
     return complete;
   }
 
@@ -98,24 +113,27 @@ public class SqlCompleter extends StringsCompleter {
    * Return list of schema names within the database
    *
    * @param meta metadata from connection to database
-   * @param schemaFilter a schema name pattern; must match the schema name
+   * @param schemaFilters a schema name patterns; must match the schema name
    *        as it is stored in the database; "" retrieves those without a schema;
    *        <code>null</code> means that the schema name should not be used to narrow
-   *        the search; supports '%' and '_' symbols; for example "prod_v_%"
+   *        the search; supports '%'; for example "prod_v_%"
    * @return set of all schema names in the database
    */
-  private static Set<String> getSchemaNames(DatabaseMetaData meta, String schemaFilter) {
+  private static Set<String> getSchemaNames(DatabaseMetaData meta, List<String> schemaFilters) {
     Set<String> res = new HashSet<>();
     try {
       ResultSet schemas = meta.getSchemas();
+
       try {
         while (schemas.next()) {
           String schemaName = schemas.getString("TABLE_SCHEM");
-          if (schemaName == null)
+          if (schemaName == null) {
             schemaName = "";
-          if (schemaFilter.equals("") || schemaFilter == null || schemaName.matches(
-                  schemaFilter.replace("_", ".").replace("%", ".*?"))) {
-            res.add(schemaName);
+          }
+          for (String schemaFilter : schemaFilters) {
+            if (schemaFilter.equals("") || schemaName.matches(schemaFilter.replace("%", ".*?"))) {
+              res.add(schemaName);
+            }
           }
         }
       } finally {
@@ -131,22 +149,23 @@ public class SqlCompleter extends StringsCompleter {
    * Return list of catalog names within the database
    *
    * @param meta metadata from connection to database
-   * @param schemaFilter a catalog name pattern; must match the catalog name
+   * @param schemaFilters a catalog name patterns; must match the catalog name
    *        as it is stored in the database; "" retrieves those without a catalog;
    *        <code>null</code> means that the schema name should not be used to narrow
-   *        the search; supports '%' and '_' symbols; for example "prod_v_%"
+   *        the search; supports '%'; for example "prod_v_%"
    * @return set of all catalog names in the database
    */
-  private static Set<String> getCatalogNames(DatabaseMetaData meta, String schemaFilter) {
+  private static Set<String> getCatalogNames(DatabaseMetaData meta, List<String> schemaFilters) {
     Set<String> res = new HashSet<>();
     try {
       ResultSet schemas = meta.getCatalogs();
       try {
         while (schemas.next()) {
           String schemaName = schemas.getString("TABLE_CAT");
-          if (schemaFilter.equals("") || schemaFilter == null || schemaName.matches(
-                  schemaFilter.replace("_", ".").replace("%", ".*?"))) {
-            res.add(schemaName);
+          for (String schemaFilter : schemaFilters) {
+            if (schemaFilter.equals("") || schemaName.matches(schemaFilter.replace("%", ".*?"))) {
+              res.add(schemaName);
+            }
           }
         }
       } finally {
@@ -158,50 +177,41 @@ public class SqlCompleter extends StringsCompleter {
     return res;
   }
 
+
+  private static void fillTableNames(String schema, DatabaseMetaData meta, Set<String> tables) {
+    try (ResultSet tbls = meta.getTables(schema, schema, "%",
+        new String[]{"TABLE", "VIEW", "ALIAS", "SYNONYM", "GLOBAL TEMPORARY", "LOCAL TEMPORARY"})) {
+      while (tbls.next()) {
+        String table = tbls.getString("TABLE_NAME");
+        tables.add(table);
+      }
+    } catch (Throwable t) {
+      logger.error("Failed to retrieve the table name", t);
+    }
+  }
+
   /**
    * Fill two map with list of tables and list of columns
    *
-   * @param catalogName name of a catalog
-   * @param meta metadata from connection to database
-   * @param schemaFilter a schema name pattern; must match the schema name
-   *        as it is stored in the database; "" retrieves those without a schema;
-   *        <code>null</code> means that the schema name should not be used to narrow
-   *        the search; supports '%' and '_' symbols; for example "prod_v_%"
-   * @param tables function fills this map, for every schema name adds
-   *        set of table names within the schema
-   * @param columns function fills this map, for every table name adds set
+   * @param schema name of a scheme
+   * @param table name of a table
+   * @param meta meta metadata from connection to database
+   * @param columns function fills this set, for every table name adds set
    *        of columns within the table; table name is in format schema_name.table_name
    */
-  private static void fillTableAndColumnNames(String catalogName, DatabaseMetaData meta,
-                                              String schemaFilter,
-                                              Map<String, Set<String>> tables,
-                                              Map<String, Set<String>> columns)  {
-    try {
-      ResultSet cols = meta.getColumns(catalogName, schemaFilter, "%",
-              "%");
-      try {
-        while (cols.next()) {
-          String schema = cols.getString("TABLE_SCHEM");
-          if (schema == null) schema = cols.getString("TABLE_CAT");
-          String table = cols.getString("TABLE_NAME");
-          String column = cols.getString("COLUMN_NAME");
-          if (!isBlank(table)) {
-            String schemaTable = schema + "." + table;
-            if (!columns.containsKey(schemaTable)) columns.put(schemaTable, new HashSet<String>());
-            columns.get(schemaTable).add(column);
-            if (!tables.containsKey(schema)) tables.put(schema, new HashSet<String>());
-            tables.get(schema).add(table);
-          }
-        }
-      } finally {
-        cols.close();
+  private static void fillColumnNames(String schema, String table, DatabaseMetaData meta,
+      Set<String> columns) {
+    try (ResultSet cols = meta.getColumns(schema, schema, table, "%")) {
+      while (cols.next()) {
+        String column = cols.getString("COLUMN_NAME");
+        columns.add(column);
       }
     } catch (Throwable t) {
       logger.error("Failed to retrieve the column name", t);
     }
   }
 
-  public static Set<String> getSqlKeywordsCompletions(Connection connection) throws IOException,
+  public static Set<String> getSqlKeywordsCompletions(DatabaseMetaData meta) throws IOException,
           SQLException {
 
     // Add the default SQL completions
@@ -211,12 +221,11 @@ public class SqlCompleter extends StringsCompleter {
 
     Set<String> completions = new TreeSet<>();
 
-    if (null != connection) {
-      DatabaseMetaData metaData = connection.getMetaData();
+    if (null != meta) {
 
       // Add the driver specific SQL completions
       String driverSpecificKeywords =
-              "/" + metaData.getDriverName().replace(" ", "-").toLowerCase() + "-sql.keywords";
+              "/" + meta.getDriverName().replace(" ", "-").toLowerCase() + "-sql.keywords";
       logger.info("JDBC DriverName:" + driverSpecificKeywords);
       try {
         if (SqlCompleter.class.getResource(driverSpecificKeywords) != null) {
@@ -234,27 +243,27 @@ public class SqlCompleter extends StringsCompleter {
 
       // Add the keywords from the current JDBC connection
       try {
-        keywords += "," + metaData.getSQLKeywords();
+        keywords += "," + meta.getSQLKeywords();
       } catch (Exception e) {
         logger.debug("fail to get SQL key words from database metadata: " + e, e);
       }
       try {
-        keywords += "," + metaData.getStringFunctions();
+        keywords += "," + meta.getStringFunctions();
       } catch (Exception e) {
         logger.debug("fail to get string function names from database metadata: " + e, e);
       }
       try {
-        keywords += "," + metaData.getNumericFunctions();
+        keywords += "," + meta.getNumericFunctions();
       } catch (Exception e) {
         logger.debug("fail to get numeric function names from database metadata: " + e, e);
       }
       try {
-        keywords += "," + metaData.getSystemFunctions();
+        keywords += "," + meta.getSystemFunctions();
       } catch (Exception e) {
         logger.debug("fail to get system function names from database metadata: " + e, e);
       }
       try {
-        keywords += "," + metaData.getTimeDateFunctions();
+        keywords += "," + meta.getTimeDateFunctions();
       } catch (Exception e) {
         logger.debug("fail to get time date function names from database metadata: " + e, e);
       }
@@ -273,96 +282,100 @@ public class SqlCompleter extends StringsCompleter {
   }
 
   /**
-   * Initializes local schema completers from list of schema names
-   *
-   * @param schemas set of schema names
-   */
-  private void initSchemas(Set<String> schemas) {
-    schemasCompleter = new StringsCompleter(new TreeSet<>(schemas));
-  }
-
-  /**
-   * Initializes local table completers from list of table name
-   *
-   * @param tables for every schema name there is a set of table names within the schema
-   */
-  private void initTables(Map<String, Set<String>> tables) {
-    tablesCompleters.clear();
-    for (Map.Entry<String, Set<String>> entry : tables.entrySet()) {
-      tablesCompleters.put(entry.getKey(), new StringsCompleter(new TreeSet<>(entry.getValue())));
-    }
-  }
-
-  /**
-   * Initializes local column completers from list of column names
-   *
-   * @param columns for every table name there is a set of columns within the table;
-   *        table name is in format schema_name.table_name
-   */
-  private void initColumns(Map<String, Set<String>> columns) {
-    columnsCompleters.clear();
-    for (Map.Entry<String, Set<String>> entry : columns.entrySet()) {
-      columnsCompleters.put(entry.getKey(), new StringsCompleter(new TreeSet<>(entry.getValue())));
-    }
-  }
-
-  /**
-   * Initializes all local completers
-   *
-   * @param schemas set of schema names
-   * @param tables for every schema name there is a set of table names within the schema
-   * @param columns for every table name there is a set of columns within the table;
-   *        table name is in format schema_name.table_name
-   * @param keywords set with sql keywords
-   */
-  public void init(Set<String> schemas, Map<String, Set<String>> tables,
-                   Map<String, Set<String>> columns, Set<String> keywords) {
-    initSchemas(schemas);
-    initTables(tables);
-    initColumns(columns);
-    keywordCompleter = new StringsCompleter(keywords);
-  }
-
-  /**
    * Initializes all local completers from database connection
    *
    * @param connection database connection
-   * @param schemaFilter a schema name pattern; must match the schema name
-   *        as it is stored in the database; "" retrieves those without a schema;
-   *        <code>null</code> means that the schema name should not be used to narrow
-   *        the search; supports '%' and '_' symbols; for example "prod_v_%"
+   * @param schemaFiltersString a comma separated schema name patterns, supports '%'  symbol;
+   *        for example "prod_v_%,prod_t_%"
    */
-  public void initFromConnection(Connection connection, String schemaFilter) {
+  public void createOrUpdateFromConnection(Connection connection, String schemaFiltersString,
+      String buffer, int cursor) {
+    try (Connection c = connection) {
+      if (schemaFiltersString == null) {
+        schemaFiltersString = StringUtils.EMPTY;
+      }
+      List<String> schemaFilters = Arrays.asList(schemaFiltersString.split(","));
+      CursorArgument cursorArgument = parseCursorArgument(buffer, cursor);
 
-    try {
-      Map<String, Set<String>> tables = new HashMap<>();
-      Map<String, Set<String>> columns = new HashMap<>();
+      Set<String> tables = new HashSet<>();
+      Set<String> columns = new HashSet<>();
       Set<String> schemas = new HashSet<>();
       Set<String> catalogs = new HashSet<>();
-      Set<String> keywords = getSqlKeywordsCompletions(connection);
-      if (connection != null) {
-        schemas = getSchemaNames(connection.getMetaData(), schemaFilter);
-        catalogs = getCatalogNames(connection.getMetaData(), schemaFilter);
+      Set<String> keywords = new HashSet<>();
 
-        if (!"".equals(connection.getCatalog())) {
-          if (schemas.size() == 0 )
-            schemas.add(connection.getCatalog());
-          fillTableAndColumnNames(connection.getCatalog(), connection.getMetaData(), schemaFilter,
-                  tables, columns);
-        } else {
-          if (schemas.size() == 0) schemas.addAll(catalogs);
-          for (String catalog : catalogs) {
-            fillTableAndColumnNames(catalog, connection.getMetaData(), schemaFilter, tables,
-                    columns);
-          }
+      if (c != null) {
+        DatabaseMetaData databaseMetaData = c.getMetaData();
+        if (keywordCompleter == null || keywordCompleter.getCompleter() == null
+            || keywordCompleter.isExpired()) {
+          keywords = getSqlKeywordsCompletions(databaseMetaData);
+          initKeywords(keywords);
         }
+        if (cursorArgument.needLoadSchemas() &&
+            (schemasCompleter == null || schemasCompleter.getCompleter() == null
+            || schemasCompleter.isExpired())) {
+          schemas = getSchemaNames(databaseMetaData, schemaFilters);
+          catalogs = getCatalogNames(databaseMetaData, schemaFilters);
+
+          if (schemas.size() == 0) {
+            schemas.addAll(catalogs);
+          }
+
+          initSchemas(schemas);
+        }
+
+        CachedCompleter tablesCompleter = tablesCompleters.get(cursorArgument.getSchema());
+        if (cursorArgument.needLoadTables() &&
+            (tablesCompleter == null || tablesCompleter.isExpired())) {
+          fillTableNames(cursorArgument.getSchema(), databaseMetaData, tables);
+          initTables(cursorArgument.getSchema(), tables);
+        }
+
+        String schemaTable =
+            String.format("%s.%s", cursorArgument.getSchema(), cursorArgument.getTable());
+        CachedCompleter columnsCompleter = columnsCompleters.get(schemaTable);
+
+        if (cursorArgument.needLoadColumns() &&
+            (columnsCompleter == null || columnsCompleter.isExpired())) {
+          fillColumnNames(cursorArgument.getSchema(), cursorArgument.getTable(), databaseMetaData,
+              columns);
+          initColumns(schemaTable, columns);
+        }
+
+        logger.info("Completer initialized with " + schemas.size() + " schemas, " +
+            columns.size() + " tables and " + keywords.size() + " keywords");
       }
-      init(schemas, tables, columns, keywords);
-      logger.info("Completer initialized with " + schemas.size() + " schemas, " +
-              columns.size() + " tables and " + keywords.size() + " keywords");
 
     } catch (SQLException | IOException e) {
-      logger.error("Failed to update the metadata conmpletions", e);
+      logger.error("Failed to update the metadata completions", e);
+    }
+  }
+
+
+
+  public void initKeywords(Set<String> keywords) {
+    if (keywords != null && !keywords.isEmpty()) {
+      keywordCompleter = new CachedCompleter(new StringsCompleter(keywords), 0);
+    }
+  }
+
+  public void initSchemas(Set<String> schemas) {
+    if (schemas != null && !schemas.isEmpty()) {
+      schemasCompleter = new CachedCompleter(
+          new StringsCompleter(new TreeSet<>(schemas)), ttlInSeconds);
+    }
+  }
+
+  public void initTables(String schema, Set<String> tables) {
+    if (tables != null && !tables.isEmpty()) {
+      tablesCompleters.put(schema, new CachedCompleter(
+          new StringsCompleter(new TreeSet<>(tables)), ttlInSeconds));
+    }
+  }
+
+  public void initColumns(String schemaTable, Set<String> columns) {
+    if (columns != null && !columns.isEmpty()) {
+      columnsCompleters.put(schemaTable,
+          new CachedCompleter(new StringsCompleter(columns), ttlInSeconds));
     }
   }
 
@@ -389,7 +402,7 @@ public class SqlCompleter extends StringsCompleter {
    * @return -1 in case of no candidates found, 0 otherwise
    */
   private int completeKeyword(String buffer, int cursor, List<CharSequence> candidates) {
-    return keywordCompleter.complete(buffer, cursor, candidates);
+    return keywordCompleter.getCompleter().complete(buffer, cursor, candidates);
   }
 
   /**
@@ -398,7 +411,7 @@ public class SqlCompleter extends StringsCompleter {
    * @return -1 in case of no candidates found, 0 otherwise
    */
   private int completeSchema(String buffer, int cursor, List<CharSequence> candidates) {
-    return schemasCompleter.complete(buffer, cursor, candidates);
+    return schemasCompleter.getCompleter().complete(buffer, cursor, candidates);
   }
 
   /**
@@ -409,10 +422,11 @@ public class SqlCompleter extends StringsCompleter {
   private int completeTable(String schema, String buffer, int cursor,
                             List<CharSequence> candidates) {
     // Wrong schema
-    if (!tablesCompleters.containsKey(schema))
+    if (schema == null || !tablesCompleters.containsKey(schema))
       return -1;
-    else
-      return tablesCompleters.get(schema).complete(buffer, cursor, candidates);
+    else {
+      return tablesCompleters.get(schema).getCompleter().complete(buffer, cursor, candidates);
+    }
   }
 
   /**
@@ -423,11 +437,12 @@ public class SqlCompleter extends StringsCompleter {
   private int completeColumn(String schema, String table, String buffer, int cursor,
                              List<CharSequence> candidates) {
     // Wrong schema or wrong table
-    if (!tablesCompleters.containsKey(schema) ||
-            !columnsCompleters.containsKey(schema + "." + table))
+    if (schema == null || table == null || !columnsCompleters.containsKey(schema + "." + table)) {
       return -1;
-    else
-      return columnsCompleters.get(schema + "." + table).complete(buffer, cursor, candidates);
+    } else {
+      return columnsCompleters.get(schema + "." + table).getCompleter()
+          .complete(buffer, cursor, candidates);
+    }
   }
 
   /**
@@ -435,62 +450,156 @@ public class SqlCompleter extends StringsCompleter {
    * a schema, a table of a column or a keyword
    *
    * @param aliases for every alias contains table name in format schema_name.table_name
-   * @param isColumnAllowed if false the function will not search and complete columns
    * @return -1 in case of no candidates found, 0 otherwise
    */
-  public int completeName(String buffer, int cursor, List<CharSequence> candidates,
-                          Map<String, String> aliases, boolean isColumnAllowed) {
-
-    if (buffer == null) buffer = "";
-
-    // no need to process after first point after cursor
-    int nextPointPos = buffer.indexOf('.', cursor);
-    if (nextPointPos != -1) buffer = buffer.substring(0, nextPointPos);
-
-    // points divide the name to the schema, table and column - find them
-    int pointPos1 = buffer.indexOf('.');
-    int pointPos2 = buffer.indexOf('.', pointPos1 + 1);
+  public int completeName(String buffer, int cursor, List<InterpreterCompletion> candidates,
+                          Map<String, String> aliases) {
+    CursorArgument cursorArgument = parseCursorArgument(buffer, cursor);
 
     // find schema and table name if they are
     String schema;
     String table;
     String column;
-    if (pointPos1 == -1) {             // process only schema or keyword case
-      schema = buffer;
-      int keywordsRes = completeKeyword(buffer, cursor, candidates);
+
+    if (cursorArgument.getSchema() == null) {             // process all
+      List<CharSequence> keywordsCandidates = new ArrayList();
       List<CharSequence> schemaCandidates = new ArrayList<>();
-      int schemaRes = completeSchema(schema, cursor, schemaCandidates);
-      candidates.addAll(schemaCandidates);
-      return Math.max(keywordsRes, schemaRes);
-    }
-    else {
-      schema = buffer.substring(0, pointPos1);
+      int keywordsRes = completeKeyword(buffer, cursor, keywordsCandidates);
+      int schemaRes = completeSchema(buffer, cursor, schemaCandidates);
+      addCompletions(candidates, keywordsCandidates, CompletionType.keyword.name());
+      addCompletions(candidates, schemaCandidates, CompletionType.schema.name());
+      return NumberUtils.max(new int[]{keywordsRes, schemaRes});
+    } else {
+      schema = cursorArgument.getSchema();
       if (aliases.containsKey(schema)) {  // process alias case
         String alias = aliases.get(schema);
         int pointPos = alias.indexOf('.');
         schema = alias.substring(0, pointPos);
         table = alias.substring(pointPos + 1);
-        column = buffer.substring(pointPos1 + 1);
-      }
-      else if (pointPos2 == -1) {        // process schema.table case
-        table = buffer.substring(pointPos1 + 1);
-        return completeTable(schema, table, cursor - pointPos1 - 1, candidates);
-      }
-      else {
-        table = buffer.substring(pointPos1 + 1, pointPos2);
-        column = buffer.substring(pointPos2 + 1);
+        column = cursorArgument.getColumn();
+        List<CharSequence> columnCandidates = new ArrayList();
+        int columnRes = completeColumn(schema, table, column, cursorArgument.getCursorPosition(),
+            columnCandidates);
+        addCompletions(candidates, columnCandidates, CompletionType.column.name());
+        // process schema.table case
+      } else if (cursorArgument.getTable() != null && cursorArgument.getColumn() == null) {
+        List<CharSequence> tableCandidates = new ArrayList();
+        table = cursorArgument.getTable();
+        int tableRes = completeTable(schema, table, cursorArgument.getCursorPosition(),
+            tableCandidates);
+        addCompletions(candidates, tableCandidates, CompletionType.table.name());
+        return tableRes;
+      } else {
+        List<CharSequence> columnCandidates = new ArrayList();
+        table = cursorArgument.getTable();
+        column = cursorArgument.getColumn();
+        int columnRes = completeColumn(schema, table, column, cursorArgument.getCursorPosition(),
+            columnCandidates);
+        addCompletions(candidates, columnCandidates, CompletionType.column.name());
       }
     }
 
-    // here in case of column
-    if (isColumnAllowed)
-      return completeColumn(schema, table, column, cursor - pointPos2 - 1, candidates);
-    else
-      return -1;
+    return -1;
   }
 
   // test purpose only
   WhitespaceArgumentDelimiter getSqlDelimiter() {
     return this.sqlDelimiter;
+  }
+
+  private void addCompletions(List<InterpreterCompletion> interpreterCompletions,
+      List<CharSequence> candidates, String meta) {
+    for (CharSequence candidate : candidates) {
+      interpreterCompletions.add(new InterpreterCompletion(candidate.toString(),
+          candidate.toString(), meta));
+    }
+  }
+
+  private CursorArgument parseCursorArgument(String buffer, int cursor) {
+    CursorArgument result = new CursorArgument();
+    if (buffer != null && buffer.length() >= cursor) {
+      String buf = buffer.substring(0, cursor);
+      if (StringUtils.isNotBlank(buf)) {
+        ArgumentList argumentList = sqlDelimiter.delimit(buf, cursor);
+        String cursorArgument = argumentList.getCursorArgument();
+        if (cursorArgument != null) {
+          int pointPos1 = cursorArgument.indexOf('.');
+          int pointPos2 = cursorArgument.indexOf('.', pointPos1 + 1);
+          if (pointPos1 > -1) {
+            result.setSchema(cursorArgument.substring(0, pointPos1).trim());
+            if (pointPos2 > -1) {
+              result.setTable(cursorArgument.substring(pointPos1 + 1, pointPos2));
+              result.setColumn(cursorArgument.substring(pointPos2 + 1));
+              result.setCursorPosition(cursor - pointPos2 - 1);
+            } else {
+              result.setTable(cursorArgument.substring(pointPos1 + 1));
+              result.setCursorPosition(cursor - pointPos1 - 1);
+            }
+          }
+        }
+      }
+    }
+
+    return result;
+  }
+
+  private class CursorArgument {
+    private String schema;
+    private String table;
+    private String column;
+    private int cursorPosition;
+
+    public String getSchema() {
+      return schema;
+    }
+
+    public void setSchema(String schema) {
+      this.schema = schema;
+    }
+
+    public String getTable() {
+      return table;
+    }
+
+    public void setTable(String table) {
+      this.table = table;
+    }
+
+    public String getColumn() {
+      return column;
+    }
+
+    public void setColumn(String column) {
+      this.column = column;
+    }
+
+    public int getCursorPosition() {
+      return cursorPosition;
+    }
+
+    public void setCursorPosition(int cursorPosition) {
+      this.cursorPosition = cursorPosition;
+    }
+
+    public boolean needLoadSchemas() {
+      if (table == null && column == null) {
+        return true;
+      }
+      return false;
+    }
+
+    public boolean needLoadTables() {
+      if (schema != null && table != null && column == null) {
+        return true;
+      }
+      return false;
+    }
+
+    public boolean needLoadColumns() {
+      if (schema != null && table != null && column != null) {
+        return true;
+      }
+      return false;
+    }
   }
 }

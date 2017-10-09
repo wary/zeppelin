@@ -24,6 +24,7 @@ import ast
 import traceback
 import warnings
 import signal
+import base64
 
 from io import BytesIO
 try:
@@ -53,7 +54,7 @@ class PyZeppelinContext(object):
 
   def __init__(self, z):
     self.z = z
-    self.paramOption = gateway.jvm.org.apache.zeppelin.display.Input.ParamOption
+    self.paramOption = gateway.jvm.org.apache.zeppelin.display.ui.OptionInput.ParamOption
     self.javaList = gateway.jvm.java.util.ArrayList
     self.max_result = 1000
     self._displayhook = lambda *args: None
@@ -195,6 +196,7 @@ host = "127.0.0.1"
 if len(sys.argv) >= 3:
   host = sys.argv[2]
 
+_zcUserQueryNameSpace = {}
 client = GatewayClient(address=host, port=int(sys.argv[1]))
 
 #gateway = JavaGateway(client, auto_convert = True)
@@ -204,8 +206,11 @@ intp = gateway.entry_point
 intp.onPythonScriptInitialized(os.getpid())
 
 java_import(gateway.jvm, "org.apache.zeppelin.display.Input")
-z = PyZeppelinContext(intp)
-z._setup_matplotlib()
+z = __zeppelin__ = PyZeppelinContext(intp)
+__zeppelin__._setup_matplotlib()
+
+_zcUserQueryNameSpace["__zeppelin__"] = __zeppelin__
+_zcUserQueryNameSpace["z"] = z
 
 output = Logger()
 sys.stdout = output
@@ -227,7 +232,7 @@ while True :
       global_hook = None
 
     try:
-      user_hook = z.getHook('post_exec')
+      user_hook = __zeppelin__.getHook('post_exec')
     except:
       user_hook = None
       
@@ -263,17 +268,17 @@ while True :
         for node in to_run_exec:
           mod = ast.Module([node])
           code = compile(mod, '<stdin>', 'exec')
-          exec(code)
+          exec(code, _zcUserQueryNameSpace)
 
         for node in to_run_single:
           mod = ast.Interactive([node])
           code = compile(mod, '<stdin>', 'single')
-          exec(code)
+          exec(code, _zcUserQueryNameSpace)
 
         for node in to_run_hooks:
           mod = ast.Module([node])
           code = compile(mod, '<stdin>', 'exec')
-          exec(code)
+          exec(code, _zcUserQueryNameSpace)
       except:
         raise Exception(traceback.format_exc())
 

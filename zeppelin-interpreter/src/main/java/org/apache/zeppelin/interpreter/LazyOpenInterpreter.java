@@ -21,7 +21,6 @@ import java.net.URL;
 import java.util.List;
 import java.util.Properties;
 
-import org.apache.zeppelin.interpreter.remote.RemoteInterpreter;
 import org.apache.zeppelin.interpreter.thrift.InterpreterCompletion;
 import org.apache.zeppelin.scheduler.Scheduler;
 
@@ -74,6 +73,11 @@ public class LazyOpenInterpreter
   }
 
   @Override
+  public InterpreterResult executePrecode(InterpreterContext interpreterContext) {
+    return intp.executePrecode(interpreterContext);
+  }
+
+  @Override
   public void close() {
     synchronized (intp) {
       if (opened == true) {
@@ -92,7 +96,12 @@ public class LazyOpenInterpreter
   @Override
   public InterpreterResult interpret(String st, InterpreterContext context) {
     open();
-    return intp.interpret(st, context);
+    ClassLoader classLoader = Thread.currentThread().getContextClassLoader();
+    try {
+      return intp.interpret(st, context);
+    } finally {
+      Thread.currentThread().setContextClassLoader(classLoader);
+    }
   }
 
   @Override
@@ -121,9 +130,10 @@ public class LazyOpenInterpreter
   }
 
   @Override
-  public List<InterpreterCompletion> completion(String buf, int cursor) {
+  public List<InterpreterCompletion> completion(String buf, int cursor,
+      InterpreterContext interpreterContext) {
     open();
-    List completion = intp.completion(buf, cursor);
+    List completion = intp.completion(buf, cursor, interpreterContext);
     return completion;
   }
 
@@ -151,7 +161,7 @@ public class LazyOpenInterpreter
   public void setClassloaderUrls(URL [] urls) {
     intp.setClassloaderUrls(urls);
   }
-  
+
   @Override
   public void registerHook(String noteId, String event, String cmd) {
     intp.registerHook(noteId, event, cmd);
@@ -180,5 +190,15 @@ public class LazyOpenInterpreter
   @Override
   public void unregisterHook(String event) {
     intp.unregisterHook(event);
+  }
+
+  @Override
+  public void setUserName(String userName) {
+    this.intp.setUserName(userName);
+  }
+
+  @Override
+  public String getUserName() {
+    return this.intp.getUserName();
   }
 }

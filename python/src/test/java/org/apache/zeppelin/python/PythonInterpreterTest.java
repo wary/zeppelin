@@ -59,6 +59,7 @@ public class PythonInterpreterTest implements InterpreterOutputListener {
     Properties p = new Properties();
     p.setProperty(ZEPPELIN_PYTHON, DEFAULT_ZEPPELIN_PYTHON);
     p.setProperty(MAX_RESULT, "1000");
+    p.setProperty("zeppelin.python.useIPython", "false");
     return p;
   }
 
@@ -85,6 +86,7 @@ public class PythonInterpreterTest implements InterpreterOutputListener {
         new LocalResourcePool("id"),
         new LinkedList<InterpreterContextRunner>(),
         out);
+    InterpreterContext.set(context);
     pythonInterpreter.open();
   }
 
@@ -105,6 +107,19 @@ public class PythonInterpreterTest implements InterpreterOutputListener {
     assertEquals(InterpreterResult.Code.SUCCESS, result.code());
     assertTrue(new String(out.getOutputAt(0).toByteArray()).contains("hi\nhi\nhi"));
  }
+
+  @Test
+  public void testRedefinitionZeppelinContext() {
+    String pyRedefinitionCode = "z = 1\n";
+    String pyRestoreCode = "z = __zeppelin__\n";
+    String pyValidCode = "z.input(\"test\")\n";
+
+    assertEquals(InterpreterResult.Code.SUCCESS, pythonInterpreter.interpret(pyValidCode, context).code());
+    assertEquals(InterpreterResult.Code.SUCCESS, pythonInterpreter.interpret(pyRedefinitionCode, context).code());
+    assertEquals(InterpreterResult.Code.ERROR, pythonInterpreter.interpret(pyValidCode, context).code());
+    assertEquals(InterpreterResult.Code.SUCCESS, pythonInterpreter.interpret(pyRestoreCode, context).code());
+    assertEquals(InterpreterResult.Code.SUCCESS, pythonInterpreter.interpret(pyValidCode, context).code());
+  }
 
   @Override
   public void onUpdateAll(InterpreterOutput out) {
